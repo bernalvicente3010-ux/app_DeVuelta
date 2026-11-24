@@ -1,0 +1,429 @@
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_material_design_icons/flutter_material_design_icons.dart';
+import 'package:proy3/constants.dart';
+import 'package:proy3/pages/tabs/tab_misobjetos.dart';
+import 'package:proy3/pages/tabs/tab_objetos.dart';
+import 'package:proy3/services/auth_services.dart';
+import 'package:proy3/utils/imagen.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:proy3/services/objetos_services.dart';
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  Future<void> _signOut() async {
+    await AuthService.instance.signOut();
+  }
+
+  int _paginaSeleccionada = 0;
+  final List<Widget> _paginas = [TabObjetos(), TabMisobjetos()];
+
+  final _formAgregar = GlobalKey<FormState>();
+  final _tituloCtrl = TextEditingController();
+  final _descCtrl = TextEditingController();
+  final _lugarCtrl = TextEditingController();
+
+  String? _tipoSeleccionado;
+  String? _categoriaSeleccionada;
+  Uint8List? _fotoBytes;
+
+  bool _guardando = false;
+  bool _seleccionandoFoto = false;
+  Map<String, dynamic> _errores = {};
+
+  @override
+  void dispose() {
+    _tituloCtrl.dispose();
+    _descCtrl.dispose();
+    _lugarCtrl.dispose();
+    super.dispose();
+  }
+
+  void _limpiarForm() {
+    _tituloCtrl.clear();
+    _descCtrl.clear();
+    _lugarCtrl.clear();
+    _tipoSeleccionado = null;
+    _categoriaSeleccionada = null;
+    _fotoBytes = null;
+    _errores = {};
+    _guardando = false;
+    _seleccionandoFoto = false;
+  }
+
+  Future<void> _seleccionarFoto(
+    StateSetter setDialogState,
+    ImageSource source,
+  ) async {
+    if (_seleccionandoFoto) return;
+
+    _seleccionandoFoto = true;
+
+    try {
+      final ImagePicker picker = ImagePicker();
+      final XFile? imagen = await picker.pickImage(source: source);
+
+      if (imagen == null) return;
+
+      final bytesOriginales = await imagen.readAsBytes();
+
+      // Comprimimos con el util: máx 1024px + JPEG (q85 → q60) + tope 1 MB
+      final bytesComprimidos = reducirFoto(bytesOriginales);
+
+      if (bytesComprimidos == null) {
+        setDialogState(() {
+          _errores['foto'] = [
+            'No se pudo comprimir la imagen (supera 1 MB). Prueba con otra foto.',
+          ];
+        });
+        return;
+      }
+
+      setDialogState(() {
+        _fotoBytes = bytesComprimidos;
+        _errores.remove('foto');
+      });
+    } catch (e) {
+      setDialogState(() {
+        _errores['foto'] = ['No se pudo abrir el selector: $e'];
+      });
+    } finally {
+      _seleccionandoFoto = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = AuthService.instance.currentUser;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            Text('Bienvenido '),
+            Text(
+              user?.displayName ?? 'Usuario',
+              style: TextStyle(
+                color: Colors.green.shade900,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Cerrar sesión',
+            icon: Icon(MdiIcons.powerStandby),
+            onPressed: _signOut,
+          ),
+        ],
+      ),
+      body: _paginas[_paginaSeleccionada],
+      floatingActionButton: FloatingActionButton(
+        backgroundColor: kPrimaryColor,
+        foregroundColor: kTextColor,
+        child: Icon(Icons.add),
+        onPressed: () {
+          showDialog(
+            barrierDismissible: false,
+            context: context,
+            builder: (dialogContext) => StatefulBuilder(
+              builder: (context, setDialogState) {
+                return AlertDialog(
+                  backgroundColor: Colors.white,
+                  title: Text(
+                    'Publicar Objeto',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  content: Form(
+                    key: _formAgregar,
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Título
+                          TextFormField(
+                            controller: _tituloCtrl,
+                            decoration: InputDecoration(
+                              labelText: 'Título del objeto',
+                              errorText: _errores['titulo']?[0],
+                            ),
+                          ),
+                          SizedBox(height: 10),
+
+                          // Descripción
+                          TextFormField(
+                            controller: _descCtrl,
+                            decoration: InputDecoration(
+                              labelText: 'Descripción',
+                              errorText: _errores['descripcion']?[0],
+                            ),
+                            maxLines: 2,
+                          ),
+                          SizedBox(height: 10),
+
+                          // Tipo (Perdido / Encontrado)
+                          DropdownButtonFormField<String>(
+                            value: _tipoSeleccionado,
+                            decoration: InputDecoration(
+                              labelText: 'Tipo',
+                              errorText: _errores['tipo']?[0],
+                            ),
+                            items: [
+                              DropdownMenuItem(
+                                value: 'Perdido',
+                                child: Text('Perdido'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Encontrado',
+                                child: Text('Encontrado'),
+                              ),
+                            ],
+                            onChanged: (val) {
+                              setDialogState(() {
+                                _tipoSeleccionado = val;
+                              });
+                            },
+                          ),
+                          SizedBox(height: 10),
+
+                          // Categoría desde Firestore (StreamBuilder)
+                          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                            stream: ObjetosServices().categorias(),
+                            builder: (context, snapshot) {
+                              List<DropdownMenuItem<String>> items = [];
+                              if (snapshot.hasData) {
+                                items = snapshot.data!.docs.map((doc) {
+                                  final nombre =
+                                      doc.data()['nombre'] as String? ?? doc.id;
+                                  return DropdownMenuItem(
+                                    value: nombre,
+                                    child: Text(nombre),
+                                  );
+                                }).toList();
+                              }
+
+                              return DropdownButtonFormField<String>(
+                                value: _categoriaSeleccionada,
+                                decoration: InputDecoration(
+                                  labelText: 'Categoría',
+                                  errorText: _errores['categoria']?[0],
+                                ),
+                                isExpanded: true,
+                                menuMaxHeight: 250,
+                                items: items,
+                                onChanged: (val) {
+                                  setDialogState(() {
+                                    _categoriaSeleccionada = val;
+                                  });
+                                },
+                              );
+                            },
+                          ),
+                          SizedBox(height: 10),
+
+                          // Lugar del campus
+                          TextFormField(
+                            controller: _lugarCtrl,
+                            decoration: InputDecoration(
+                              labelText: 'Lugar del campus',
+                              hintText: 'Ej: Laboratorio U100',
+                              errorText: _errores['lugar']?[0],
+                            ),
+                          ),
+                          SizedBox(height: 15),
+
+                          // Foto del objeto
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Foto del objeto (Obligatoria):',
+                                style: TextStyle(fontWeight: FontWeight.w500),
+                              ),
+                              SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  IconButton.filledTonal(
+                                    icon: Icon(Icons.photo_library),
+                                    tooltip: 'Galería',
+                                    onPressed: () => _seleccionarFoto(
+                                      setDialogState,
+                                      ImageSource.gallery,
+                                    ),
+                                  ),
+                                  IconButton.filledTonal(
+                                    icon: Icon(Icons.camera_alt),
+                                    tooltip: 'Cámara',
+                                    onPressed: () => _seleccionarFoto(
+                                      setDialogState,
+                                      ImageSource.camera,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              if (_fotoBytes != null)
+                                Container(
+                                  margin: EdgeInsets.only(top: 8),
+                                  height: 100,
+                                  width: double.infinity,
+                                  decoration: BoxDecoration(
+                                    border: Border.all(color: Colors.grey),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Image.memory(
+                                    _fotoBytes!,
+                                    fit: BoxFit.cover,
+                                  ),
+                                ),
+                              if (_errores['foto'] != null)
+                                Padding(
+                                  padding: EdgeInsets.only(top: 4),
+                                  child: Text(
+                                    _errores['foto'][0],
+                                    style: TextStyle(
+                                      color: Colors.red,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () {
+                        Navigator.pop(dialogContext);
+                      },
+                      child: Text('Cancelar'),
+                    ),
+                    FilledButton(
+                      onPressed: () async {
+                        if (_guardando) return;
+
+                        // Validaciones previas
+                        Map<String, dynamic> nuevosErrores = {};
+                        if (_tituloCtrl.text.trim().isEmpty) {
+                          nuevosErrores['titulo'] = [
+                            'El título es obligatorio',
+                          ];
+                        }
+                        if (_descCtrl.text.trim().isEmpty) {
+                          nuevosErrores['descripcion'] = [
+                            'La descripción es obligatoria',
+                          ];
+                        }
+                        if (_tipoSeleccionado == null) {
+                          nuevosErrores['tipo'] = ['Selecciona un tipo'];
+                        }
+                        if (_categoriaSeleccionada == null) {
+                          nuevosErrores['categoria'] = [
+                            'Selecciona una categoría',
+                          ];
+                        }
+                        if (_lugarCtrl.text.trim().isEmpty) {
+                          nuevosErrores['lugar'] = ['El lugar es obligatorio'];
+                        }
+                        if (_fotoBytes == null) {
+                          nuevosErrores['foto'] = [
+                            'Debes incluir una foto del objeto',
+                          ];
+                        }
+
+                        if (nuevosErrores.isNotEmpty) {
+                          setDialogState(() {
+                            _errores = nuevosErrores;
+                          });
+                          return;
+                        }
+
+                        setDialogState(() {
+                          _guardando = true;
+                        });
+
+                        try {
+                          final currentUser = AuthService.instance.currentUser;
+                          await ObjetosServices().agregarObjeto(
+                            titulo: _tituloCtrl.text.trim(),
+                            descripcion: _descCtrl.text.trim(),
+                            tipo: _tipoSeleccionado!,
+                            categoria: _categoriaSeleccionada!,
+                            lugar: _lugarCtrl.text.trim(),
+                            fechaHora: DateTime.now().toString(),
+                            foto: _fotoBytes!,
+                            autorId: currentUser?.uid ?? '',
+                            autorNombre: currentUser?.displayName ?? 'Usuario',
+                          );
+
+                          if (!mounted || !dialogContext.mounted) return;
+                          Navigator.pop(dialogContext);
+                        } catch (e) {
+                          setDialogState(() {
+                            _errores = {
+                              'titulo': ['Error al guardar: $e'],
+                            };
+                          });
+                        } finally {
+                          setDialogState(() {
+                            _guardando = false;
+                          });
+                        }
+                      },
+                      child: _guardando
+                          ? SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : Text('Publicar'),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ).then((_) => _limpiarForm());
+        },
+      ),
+      bottomNavigationBar: NavigationBarTheme(
+        data: NavigationBarThemeData(
+          backgroundColor: kPrimaryColor,
+          indicatorColor: Colors.white,
+        ),
+        child: NavigationBar(
+          selectedIndex: _paginaSeleccionada,
+          onDestinationSelected: (index) {
+            setState(() {
+              _paginaSeleccionada = index;
+            });
+          },
+          destinations: [
+            NavigationDestination(
+              icon: Icon(Icons.inventory_2_outlined),
+              selectedIcon: Icon(Icons.inventory_2),
+              label: 'Objetos perdidos',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.person_outline),
+              label: 'Mis objetos',
+              selectedIcon: Icon(Icons.person),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
